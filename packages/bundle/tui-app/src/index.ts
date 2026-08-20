@@ -1,9 +1,10 @@
 /**
  * @deepseek-ai/dsh-tui-app — interactive terminal REPL. The bundle patch rides
  * over dsh-base without Host, HTTP, or browser plugins; this runner creates
- * one Agent through the core registry, drives turns with live token streaming
- * (`assistant/chunk` text deltas), renders user/tool/assistant lines with
- * ANSI colors in the alternate screen, and re-prompts until the user exits.
+ * one Agent through the core registry and drives a full-screen
+ * Claude Code / opencode-style surface (see ./ui.ts): conversation scrollback,
+ * fixed input bar with prompt history and slash-command completion, status
+ * bar, and live token streaming via `assistant/chunk` text deltas.
  *
  * Slash commands: /help /exit /quit /clear /model /status /stream on|off
  *
@@ -11,7 +12,6 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { createInterface, type Interface } from 'node:readline'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
@@ -20,6 +20,7 @@ import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { Tui, type TuiCommand } from './ui.ts'
 // Empty type imports carry the loader Context merge for the settlement await
 // and the cmdline Context merge for the appExit host value.
 import type {} from '@deepseek-ai/cordis-plugin-loader'
@@ -52,29 +53,13 @@ interface TuiIo {
   exit(code: number): void
 }
 
-/** The process streams the runner writes to; tests substitute captures. */
-export const internals: { stdout: TuiIo['stdout']; stderr: TuiIo['stderr'] } = {
-  stdout: process.stdout,
-  stderr: process.stderr,
+/** The subset of an Agent the REPL drives. */
+interface TuiAgent {
+  session: { seq: number; events: readonly SessionEvent[]; id?: string }
+  ctx: { on(event: 'session/event', listener: (session: unknown, event: SessionEvent) => void): () => void }
+  followup(message: unknown): void
+  whenIdle(): Promise<void>
 }
-
-/** Minimal ANSI styling for the terminal surface. */
-const ANSI = {
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  dim: '\x1b[2m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  magenta: '\x1b[35m',
-  cyan: '\x1b[36m',
-  clearScreen: '\x1b[2J\x1b[H',
-  altEnter: '\x1b[?1049h',
-  altLeave: '\x1b[?1049l',
-  hideCursor: '\x1b[?25l',
-  showCursor: '\x1b[?25h',
-} as const
 
 /** Aggregate the final assistant text and turn outcome in one owned interval. */
 function summarize(events: readonly SessionEvent[], firstSeq: number): { text: string; reason: SessionEvent<'turn/end'>['data']['reason'] | undefined } {
@@ -100,37 +85,28 @@ function summarize(events: readonly SessionEvent[], firstSeq: number): { text: s
   return { text, reason }
 }
 
-/** The subset of an Agent the REPL drives. */
-interface TuiAgent {
-  session: { seq: number; events: readonly SessionEvent[] }
-  ctx: { on(event: 'session/event', listener: (session: unknown, event: SessionEvent) => void): () => void }
-  followup(message: unknown): void
-  whenIdle(): Promise<void>
-}
-
 /**
- * Run one turn against `agent`: subscribe to live chunks (when streaming),
- * submit the user message, wait for quiescence, flush the session, then print
- * the aggregate answer (only when not already streamed).
+ * Run one turn against `agent`, streaming chunks into the UI and reporting
+ * tool activity and the final outcome. Prints the aggregate answer only when
+ * nothing was streamed (e.g. streaming disabled).
  * @param agent - the live agent to drive.
- * @param io - process-facing effects.
+ * @param ui - the terminal surface.
  * @param sessions - session store, for the durability flush.
  * @param prompt - the user prompt text.
  * @param streaming - render text deltas live.
- * @param onTool - callback for dim tool-activity lines.
  */
 async function runTurn(
   agent: TuiAgent,
-  io: TuiIo,
+  ui: Tui,
   sessions: { flush(session: unknown): Promise<unknown> },
   prompt: string,
   streaming: boolean,
-  onTool: (name: string) => void,
-): Promise<{ text: string; streamed: boolean; reason: SessionEvent<'turn/end'>['data']['reason'] | undefined }> {
+): Promise<void> {
   const firstSeq = agent.session.seq
   let streamed = false
   let stop: (() => void) | undefined
   if (streaming) {
+    ui.beginStreaming()
     stop = agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session) return
       if (event.seq < firstSeq) return
@@ -138,10 +114,10 @@ async function runTurn(
         const chunk = event.data.chunk
         if (chunk.type === 'text-delta') {
           streamed = true
-          io.stdout.write(chunk.text)
+          ui.streamChunk(chunk.text)
         }
       } else if (event.type === 'tool/call') {
-        onTool(String(event.data.name ?? 'tool'))
+        ui.append({ kind: 'tool', text: String(event.data.name ?? 'tool') })
       }
     })
   }
@@ -151,29 +127,20 @@ async function runTurn(
   }))
   await agent.whenIdle()
   stop?.()
+  ui.endStreaming()
   await sessions.flush(agent.session)
   const outcome = summarize(agent.session.events, firstSeq)
-  if (!streamed && outcome.text !== '') io.stdout.write(outcome.text + '\n')
-  if (outcome.reason?.kind === 'error') {
-    io.stderr.write(`${ANSI.red}dsh: ${outcome.reason.error.code}: ${outcome.reason.error.message}${ANSI.reset}\n`)
+  if (!streamed && outcome.text !== '') {
+    ui.append({ kind: 'assistant', text: outcome.text })
   }
-  return { ...outcome, streamed }
-}
-
-/** Render one user prompt line. */
-function printUser(io: TuiIo, text: string): void {
-  io.stdout.write(`${ANSI.cyan}${ANSI.bold}❯ ${text}${ANSI.reset}\n`)
-}
-
-/** Render a dim tool-activity line. */
-function printTool(io: TuiIo, name: string): void {
-  io.stdout.write(`${ANSI.dim}⏱ ${name}${ANSI.reset}\n`)
+  if (outcome.reason?.kind === 'error') {
+    ui.append({ kind: 'error', text: `${outcome.reason.error.code}: ${outcome.reason.error.message}` })
+  }
 }
 
 /**
- * Run the interactive REPL: if a seed task was provided, run it first, then
- * loop reading lines until the user exits.
- * @param ctx - plugin context carrying the Agent, default model, Session, and launcher IO services.
+ * Run the interactive REPL through the full-screen surface.
+ * @param ctx - plugin context carrying core services and the launcher exit request.
  * @param io - process-facing effects.
  * @param seed - optional boot-time task.
  * @param streaming - initial stream mode.
@@ -188,14 +155,6 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
   // Early process shutdown can dispose the tree while settlement is pending.
   if (agents === undefined || defaultModel === undefined || sessions === undefined) return
 
-  // Enter the alternate screen for a full-surface TUI; guarantee restoration
-  // even on abrupt exit (SIGINT/SIGTERM go through the launcher's handlers).
-  io.stdout.write(ANSI.altEnter)
-  process.on('exit', () => {
-    process.stdout.write(ANSI.altLeave + ANSI.showCursor)
-  })
-  io.stdout.write(ANSI.clearScreen + ANSI.hideCursor)
-
   const selection = defaultModel.currentSelection()
   const { agent } = await agents.create({
     sessionId: SessionId(`session-${randomUUID()}`),
@@ -209,107 +168,54 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
   await agent.whenIdle()
 
   const sessionId = agent.session.id ?? '?'
-  const header = `${ANSI.bold}DeepSeek Harness TUI${ANSI.reset} ${ANSI.dim}· ${selection.provider}/${selection.model} · session ${sessionId}${ANSI.reset}`
-  io.stdout.write(header + '\n')
-  io.stdout.write(`${ANSI.dim}/help for commands · /exit to quit${ANSI.reset}\n\n`)
-  io.stdout.write(ANSI.showCursor)
+  const shortId = sessionId.replace(/^session-/, '').slice(0, 8)
+  const status = (): string =>
+    `${selection.provider}/${selection.model} · ${shortId} · ${streaming ? 'stream on' : 'stream off'}`
 
-  // Run the seed (if any) BEFORE opening readline, so an immediately-closed
-  // stdin cannot abort the in-flight turn via the close handler.
-  if (seed.trim() !== '') {
-    printUser(io, seed)
-    await runTurn(agent, io, sessions, seed, streaming, name => printTool(io, name))
-    io.stdout.write('\n')
-  }
-
-  const rl: Interface = createInterface({
-    input: process.stdin,
-    // readline needs a full WritableStream; routing through process.stdout keeps
-    // prompts echoing to the real terminal (the common output target).
-    output: process.stdout,
-  })
-  let closed = false
-  let pendingResolve: ((line: string) => void) | undefined
-  // Do NOT exit from the close handler: stdin may close while a turn is still
-  // running (piped input), and an immediate exit would abort the in-flight
-  // agent turn. Flag it and settle any pending prompt so the loop can leave
-  // cleanly between turns (readline never fires a pending question callback
-  // once the interface closes, so we resolve it ourselves).
-  rl.on('close', () => {
-    closed = true
-    pendingResolve?.('')
-    pendingResolve = undefined
-  })
-  const ask = (query: string): Promise<string> => new Promise((resolve) => {
-    if (closed) return resolve('')
-    pendingResolve = resolve
-    rl.question(query, (line) => {
-      pendingResolve = undefined
-      resolve(line)
-    })
-  })
-
-  const quit = async (): Promise<void> => {
-    // Fire-and-forget durability flush: never let it block leaving the REPL.
-    void sessions.flush(agent.session).catch(() => {})
-    io.stdout.write(ANSI.altLeave + ANSI.showCursor + '\n')
-    io.exit(0)
-  }
-
-  const loop = async (): Promise<void> => {
-    for (;;) {
-      const line = (await ask('dsh> ')).trim()
-      if (closed) {
-        await quit()
-        return
-      }
-      if (line === '') continue
-      const lower = line.toLowerCase()
-      if (lower === 'q' || lower === 'quit' || lower === ':q' || lower === '/exit' || lower === '/quit') {
-        await quit()
-        return
-      }
-      if (lower === '/help' || lower === '?') {
-        io.stdout.write(`${ANSI.dim}commands: /help /clear /model /status /stream on|off /exit — or q / quit / :q${ANSI.reset}\n`)
-        continue
-      }
-      if (lower === '/clear' || lower === 'clear') {
-        io.stdout.write(ANSI.clearScreen)
-        continue
-      }
-      if (lower === '/model') {
-        io.stdout.write(`${ANSI.dim}model: ${selection.provider}/${selection.model}${ANSI.reset}\n`)
-        continue
-      }
-      if (lower === '/status') {
-        io.stdout.write(`${ANSI.dim}session: ${sessionId} · cwd: ${process.cwd()} · events: ${agent.session.events.length}${ANSI.reset}\n`)
-        continue
-      }
-      if (lower.startsWith('/stream')) {
-        const arg = lower.split(/\s+/)[1]
+  const commands: TuiCommand[] = [
+    { name: 'help', usage: '', help: 'show this help', handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /status /stream on|off /exit — or q / quit / :q' }) },
+    { name: 'clear', usage: '', help: 'clear the conversation area', handler: () => ui.clearLog() },
+    { name: 'model', usage: '', help: 'show the active model', handler: () => ui.append({ kind: 'system', text: `model: ${selection.provider}/${selection.model}` }) },
+    { name: 'status', usage: '', help: 'show session and workspace info', handler: () => ui.append({ kind: 'system', text: `session: ${sessionId} · cwd: ${process.cwd()} · events: ${agent.session.events.length}` }) },
+    {
+      name: 'stream',
+      usage: 'on|off',
+      help: 'toggle live token streaming',
+      handler: (args) => {
+        const arg = args.toLowerCase()
         if (arg === 'on' || arg === 'off') {
           streaming = arg === 'on'
-          io.stdout.write(`${ANSI.dim}streaming: ${streaming ? 'on' : 'off'}${ANSI.reset}\n`)
+          ui.append({ kind: 'system', text: `streaming: ${streaming ? 'on' : 'off'}` })
         } else {
-          io.stdout.write(`${ANSI.dim}usage: /stream on|off (current: ${streaming ? 'on' : 'off'})${ANSI.reset}\n`)
+          ui.append({ kind: 'system', text: `usage: /stream on|off (current: ${streaming ? 'on' : 'off'})` })
         }
-        continue
-      }
-      if (lower.startsWith('/')) {
-        io.stdout.write(`${ANSI.red}unknown command: ${line}${ANSI.reset}\n`)
-        continue
-      }
-      printUser(io, line)
-      await runTurn(agent, io, sessions, line, streaming, name => printTool(io, name))
-      io.stdout.write('\n')
-      if (closed) {
-        await quit()
-        return
-      }
-    }
-  }
+      },
+    },
+    { name: 'exit', usage: '', help: 'leave the session', handler: () => ui.requestExit() },
+    { name: 'quit', usage: '', help: 'leave the session', handler: () => ui.requestExit() },
+  ]
 
-  void loop()
+  const ui = new Tui({
+    commands,
+    status: status(),
+    onPrompt: (line) => {
+      void (async () => {
+        ui.append({ kind: 'user', text: line })
+        await runTurn(agent, ui, sessions, line, streaming)
+        ui.setStatus(status())
+      })()
+    },
+    onExit: () => {
+      io.stdout.write('\n')
+      io.exit(0)
+    },
+  })
+  ui.start()
+
+  // Seed task: run through the same turn path, then the user keeps prompting.
+  if (seed.trim() !== '') {
+    ui.submit(seed)
+  }
 }
 
 /**
@@ -324,7 +230,7 @@ export function apply(ctx: Context, config: Config): void {
   if (exit === undefined) {
     throw new Error('tui-runner: the launcher must provide ctx.appExit before the tree mounts')
   }
-  const io: TuiIo = { stdout: internals.stdout, stderr: internals.stderr, exit }
+  const io: TuiIo = { stdout: process.stdout, stderr: process.stderr, exit }
   void run(ctx, io, config.task, config.streaming).catch((error: unknown) => {
     io.stderr.write(`dsh: ${error instanceof Error ? error.message : String(error)}\n`)
     io.exit(1)
