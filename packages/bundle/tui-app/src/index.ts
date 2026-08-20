@@ -103,6 +103,8 @@ async function runTurn(
   streaming: boolean,
 ): Promise<void> {
   const firstSeq = agent.session.seq
+  const startedAt = Date.now()
+  const tokensBefore = ui.tokens()
   let streamed = false
   let stop: (() => void) | undefined
   if (streaming) {
@@ -151,7 +153,16 @@ async function runTurn(
   if (outcome.reason?.kind === 'error') {
     ui.append({ kind: 'error', text: `${outcome.reason.error.code}: ${outcome.reason.error.message}` })
   }
-  ui.append({ kind: 'separator', text: '' })
+  const tokensAfter = ui.tokens()
+  ui.append({
+    kind: 'separator',
+    text: '',
+    meta: {
+      seconds: Math.round((Date.now() - startedAt) / 1000),
+      tokensIn: tokensAfter.in - tokensBefore.in,
+      tokensOut: tokensAfter.out - tokensBefore.out,
+    },
+  })
 }
 
 /** Compact preview of a tool call's JSON arguments. */
@@ -209,8 +220,9 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
 
   const sessionId = agent.session.id ?? '?'
   const shortId = sessionId.replace(/^session-/, '').slice(0, 8)
-  const status = (): string =>
-    `${selection.provider}/${selection.model} · ${shortId} · ${streaming ? 'stream on' : 'stream off'}`
+  const cwd = process.cwd()
+  const header = (): string => `${selection.provider}/${selection.model} · session ${shortId}`
+  const status = (): string => `${cwd} · ${streaming ? 'stream on' : 'stream off'}`
 
   const commands: TuiCommand[] = [
     { name: 'help', usage: '', help: 'show this help', handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }) },
@@ -254,17 +266,16 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
 
   const ui = new Tui({
     commands,
+    header: header(),
     status: status(),
     onPrompt: (line) => {
       void (async () => {
         ui.append({ kind: 'user', text: line })
         ui.setBusy(true)
-        ui.setStatus(status())
         try {
           await runTurn(agent, ui, sessions, line, streaming)
         } finally {
           ui.setBusy(false)
-          ui.setStatus(status())
         }
       })()
     },
