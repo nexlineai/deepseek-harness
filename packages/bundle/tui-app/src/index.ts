@@ -18,6 +18,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { access } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { arch, platform, release } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
@@ -433,6 +436,67 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     { name: 'danger-full-access', sandbox: 'danger-full-access', approval: 'never', description: 'Full file access without prompts' },
   ]
 
+  /** dsh-tui build identity. */
+  const TUI_VERSION = '0.1.0'
+
+  async function versionCommand(): Promise<void> {
+    const sel = selected.current ?? selection
+    ui.append({ kind: 'system', text: `dsh-tui ${TUI_VERSION} · ${sel.provider}/${sel.model} · node ${process.version} · ${platform()} ${arch()} (${release()})` })
+  }
+
+  async function doctorCommand(): Promise<void> {
+    const results: Array<{ ok: boolean; label: string; detail: string }> = []
+    const check = (ok: boolean, label: string, detail: string): void => { results.push({ ok, label, detail }) }
+
+    // Environment.
+    const key = process.env.DEEPSEEK_API_KEY ?? process.env.DEEPSEEK_API_TOKEN
+    check(key !== undefined && key !== '', 'DeepSeek API key', key !== undefined ? 'DEEPSEEK_API_KEY set' : 'DEEPSEEK_API_KEY missing (set it to talk to the model)')
+
+    // Workspace.
+    try {
+      await access(process.cwd(), fsConstants.R_OK | fsConstants.W_OK)
+      check(true, 'workspace', `${process.cwd()} readable + writable`)
+    } catch {
+      check(false, 'workspace', `${process.cwd()} not writable`)
+    }
+
+    // Model catalog.
+    try {
+      catalog = await buildCatalog()
+      if (catalog.length === 0) {
+        check(false, 'models', 'no models discovered — is the llm adapter mounted?')
+      } else {
+        check(true, 'models', `${catalog.length} model(s) across ${new Set(catalog.map(m => m.provider)).size} provider(s)`)
+      }
+    } catch (error) {
+      check(false, 'models', `catalog failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    // Session browsing.
+    check(sessionQuery !== undefined, 'session persistence', sessionQuery !== undefined ? 'session list/resume available' : 'session-query not mounted')
+    check(compaction !== undefined, 'compaction', compaction !== undefined ? 'compaction available' : 'compaction not mounted')
+    check(planMode !== undefined, 'plan mode', planMode !== undefined ? 'plan mode available' : 'plan mode not mounted')
+
+    ui.append({ kind: 'system', text: 'dsh-tui doctor' })
+    for (const result of results) {
+      const mark = result.ok ? '✓' : '✖'
+      ui.append({ kind: result.ok ? 'system' : 'error', text: `${mark} ${result.label} — ${result.detail}` })
+    }
+    ui.append({ kind: 'system', text: 'to test end-to-end, just send a prompt' })
+  }
+
+  async function settingsCommand(): Promise<void> {
+    const sel = selected.current ?? selection
+    const preset = permissionPresets !== undefined ? permissionPresets.current(activeAgent.session.events) : 'unknown'
+    const planState = planMode !== undefined ? planMode.get(activeAgent) : undefined
+    ui.append({ kind: 'system', text: 'current session' })
+    ui.append({ kind: 'system', text: `  model      ${sel.provider}/${sel.model}${sel.reasoningEffort !== undefined ? ` (reasoning ${sel.reasoningEffort})` : ''}` })
+    ui.append({ kind: 'system', text: `  stream     ${streaming ? 'on' : 'off'} · reasoning display ${showReasoning ? 'on' : 'off'}` })
+    ui.append({ kind: 'system', text: `  permission ${preset}` })
+    ui.append({ kind: 'system', text: `  plan mode  ${planState?.active === true ? 'on' : 'off'}` })
+    ui.append({ kind: 'system', text: `  session    ${activeAgent.session.id} · ${turnCount} turns · ${activeAgent.session.events.length} events` })
+  }
+
   async function permissionsCommand(args: string): Promise<void> {
     if (permissionPresets === undefined) {
       ui.append({ kind: 'error', text: 'permission presets are not mounted in this profile' })
@@ -537,7 +601,7 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
       name: 'help',
       usage: '',
       help: 'show this help',
-      handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /resume /compact /permissions /plan /trajectory /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }),
+      handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /resume /compact /permissions /plan /trajectory /settings /doctor /version /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }),
     },
     { name: 'clear', usage: '', help: 'clear the conversation area', handler: () => ui.clearLog() },
     { name: 'model', usage: '[id] [effort]', help: 'list models + reasoning efforts; switch live', handler: args => void modelCommand(args) },
@@ -546,6 +610,9 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     { name: 'permissions', usage: '[name]', help: 'list/switch read-only, workspace-write, full access', handler: args => void permissionsCommand(args) },
     { name: 'plan', usage: '', help: 'toggle plan mode (next step)', handler: () => void planCommand() },
     { name: 'trajectory', usage: '', help: 'show the session event timeline', handler: () => void trajectoryCommand() },
+    { name: 'settings', usage: '', help: 'show model, permission, plan, stream state', handler: () => void settingsCommand() },
+    { name: 'doctor', usage: '', help: 'environment + model catalog health check', handler: () => void doctorCommand() },
+    { name: 'version', usage: '', help: 'show dsh-tui and runtime versions', handler: () => void versionCommand() },
     { name: 'status', usage: '', help: 'show session and workspace info', handler: () => ui.append({ kind: 'system', text: `session: ${activeAgent.session.id} · cwd: ${process.cwd()} · events: ${activeAgent.session.events.length} · turns: ${turnCount}` }) },
     {
       name: 'reasoning',
