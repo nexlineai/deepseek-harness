@@ -56,6 +56,12 @@ The TUI uses the same credential sources as the harness (`DEEPSEEK_API_KEY` / `s
 
 ---
 
+## Demo
+
+A representative session transcript — streaming answer, reasoning block, tool card, trajectory, doctor, model picker — is in [`demo/session.md`](./demo/session.md).
+
+---
+
 ## Commands
 
 | Command | Description |
