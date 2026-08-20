@@ -3,7 +3,7 @@
  *
  * A Claude Code / opencode-style full-screen layout rendered with raw ANSI:
  *
- *   ┌ DeepSeek Harness TUI          model · /Users/zdb/deepseek-harness ┐  header
+ *   ┌ DeepSeek Harness TUI            model · ~/project ──────────────────┐  header
  *   │ ────────────────────────────────────────────────────────── · 12s ┐│  separator (turn meta)
  *   │ ❯ count to 3                                                    │  user (bold, cyan prefix)
  *   │ ✻ thinking                                                      │  reasoning (dim italic)
