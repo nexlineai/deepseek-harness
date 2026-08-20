@@ -44,7 +44,7 @@ export interface TuiEntry {
   /** Tool args / output preview lines. */
   detail?: string
   /** Turn statistics (kind 'separator'). */
-  meta?: { seconds: number; tokensIn: number; tokensOut: number }
+  meta?: { time?: string; seconds: number; tokensIn: number; tokensOut: number }
 }
 
 /** Commands the UI knows about for / completion and help. */
@@ -232,8 +232,9 @@ export class Tui {
   private renderQueued = false
   private resizeListener: (() => void) | undefined
 
-  // Busy state: spinner + status redraw only.
+  // Busy state: animated spinner + full-frame ticks while a turn runs.
   private busy = false
+  private busySince = 0
   private spinnerFrame = 0
   private spinnerTimer: ReturnType<typeof setInterval> | undefined
 
@@ -333,10 +334,13 @@ export class Tui {
   setBusy(busy: boolean): void {
     this.busy = busy
     if (busy) {
+      this.busySince = Date.now()
       this.spinnerFrame = 0
       this.spinnerTimer ??= setInterval(() => {
         this.spinnerFrame = (this.spinnerFrame + 1) % SPINNER.length
-        this.renderStatusLine()
+        // Full render so the thinking line, tool markers, and elapsed time
+        // all animate together.
+        this.render()
       }, 100)
     } else if (this.spinnerTimer) {
       clearInterval(this.spinnerTimer)
@@ -678,9 +682,9 @@ export class Tui {
   private separatorRow(entry: TuiEntry, cols: number): LogRow {
     const meta = entry.meta
     const right = meta !== undefined
-      ? ` ${meta.seconds}s · ${meta.tokensIn}→${meta.tokensOut} tok`
+      ? ` ${meta.time ?? ''} · ${meta.seconds}s · ${meta.tokensIn}→${meta.tokensOut} tok`
       : ''
-    const lineLen = Math.max(1, cols - 2 - right.length)
+    const lineLen = Math.max(1, cols - 2 - width(right))
     const text = `${ANSI.dim}${BOX.h.repeat(lineLen)}${right}${ANSI.reset}`
     return { text, w: width(text) }
   }
@@ -691,7 +695,7 @@ export class Tui {
     const title = `⏱ ${entry.name ?? 'tool'}`
     const statusMark = entry.status === 'done' ? `${ANSI.green}✓ done${ANSI.reset}`
       : entry.status === 'error' ? `${ANSI.red}✖ error${ANSI.reset}`
-        : `${ANSI.yellow}● running${ANSI.reset}`
+        : `${ANSI.yellow}${SPINNER[this.spinnerFrame]} running${ANSI.reset}`
     const rows: LogRow[] = []
     // Top border: ┌─ title ───────────────┐
     rows.push({ text: `${ANSI.grey}${BOX.tl}${BOX.h} ${title}${ANSI.reset}${ANSI.grey}${' '.repeat(Math.max(0, inner - title.length - 1))}${BOX.h}${BOX.tr}${ANSI.reset}`, w: cols })
@@ -779,7 +783,10 @@ export class Tui {
   }
 
   private busyInputRow(): string {
-    return `${ANSI.eraseLine}${ANSI.dim}${SPINNER[this.spinnerFrame]} thinking…${ANSI.reset}\n`
+    const dots = ['.', '..', '...', '…'][this.spinnerFrame % 4]
+    const elapsed = Math.max(0, Math.round((Date.now() - this.busySince) / 1000))
+    const elapsedText = this.busySince > 0 ? ` ${elapsed}s` : ''
+    return `${ANSI.eraseLine}${ANSI.dim}${SPINNER[this.spinnerFrame]} thinking${dots}${elapsedText}${ANSI.reset}\n`
   }
 
   private statusRow(cols: number): string {
@@ -796,12 +803,6 @@ export class Tui {
     // No trailing newline: this row is the last one on screen, and a newline
     // would scroll the whole terminal.
     return `${ANSI.eraseLine}${ANSI.dim}${left}${' '.repeat(pad)}${right}${ANSI.reset}`
-  }
-
-  private renderStatusLine(): void {
-    if (this.exited) return
-    const { rows, cols } = this.dims()
-    process.stdout.write(ANSI.cursorAt(rows, 1) + this.statusRow(cols) + ANSI.showCursor)
   }
 
   private suggestions(): string {

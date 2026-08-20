@@ -28,6 +28,8 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-query'
 import type {} from '@deepseek-ai/dsh-compaction'
+import type {} from '@deepseek-ai/dsh-permission-presets'
+import type {} from '@deepseek-ai/dsh-plan-mode'
 import { Tui, type TuiCommand } from './ui.ts'
 // Empty type imports carry the loader Context merge for the settlement await
 // and the cmdline Context merge for the appExit host value.
@@ -38,7 +40,7 @@ import type {} from '@deepseek-ai/dsh-cmdline'
 export const name = 'tui-runner'
 
 /** Core services required before the interactive turn can start. */
-export const inject = ['agentDefaultModel', 'agents', 'sessions', 'sessionQuery', 'compaction']
+export const inject = ['agentDefaultModel', 'agents', 'sessions', 'sessionQuery', 'compaction', 'permissionPresets', 'planMode']
 
 /** Plugin config: the seed task and stream mode resolved from the startup provider. */
 export interface Config {
@@ -161,6 +163,7 @@ async function runTurn(
     kind: 'separator',
     text: '',
     meta: {
+      time: new Date().toISOString().slice(11, 19),
       seconds: Math.round((Date.now() - startedAt) / 1000),
       tokensIn: tokensAfter.in - tokensBefore.in,
       tokensOut: tokensAfter.out - tokensBefore.out,
@@ -224,6 +227,8 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
   const sessionQuery = ctx.get('sessionQuery')
   const compaction = ctx.get('compaction')
   const llm = ctx.get('llm')
+  const permissionPresets = ctx.get('permissionPresets')
+  const planMode = ctx.get('planMode')
   // Early process shutdown can dispose the tree while settlement is pending.
   if (agents === undefined || defaultModel === undefined || sessions === undefined) return
   // Capture narrowed services so hoisted closures below keep them defined.
@@ -260,7 +265,7 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     return `${sel.provider}/${sel.model} · session ${activeSessionShort()}`
   }
   const activeSessionShort = (): string => (activeAgent.session.id ?? '?').replace(/^session-/, '').slice(0, 8)
-  const status = (): string => `${cwd} · ${streaming ? 'stream on' : 'stream off'}`
+  const status = (): string => `${cwd} · ${streaming ? 'stream on' : 'stream off'}${turnCount > 0 ? ` · ${turnCount} turns` : ''}`
 
   // ── /model ────────────────────────────────────────────────────────────────
 
@@ -427,19 +432,116 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
   // ── command table ─────────────────────────────────────────────────────────
 
   let showReasoning = true
+  let turnCount = 0
+
+  /** The three permission presets shipped by the base bundle. */
+  const PRESETS: Array<{ name: string; sandbox: string; approval: string; description: string }> = [
+    { name: 'read-only', sandbox: 'read-only', approval: 'ask', description: 'Read files only; writes require approval' },
+    { name: 'workspace-write', sandbox: 'workspace-write', approval: 'ask', description: 'Write inside the workspace; wider access needs approval' },
+    { name: 'danger-full-access', sandbox: 'danger-full-access', approval: 'never', description: 'Full file access without prompts' },
+  ]
+
+  async function permissionsCommand(args: string): Promise<void> {
+    if (permissionPresets === undefined) {
+      ui.append({ kind: 'error', text: 'permission presets are not mounted in this profile' })
+      return
+    }
+    const name = args.trim().toLowerCase()
+    if (name === '') {
+      const current = permissionPresets.current(activeAgent.session.events as never)
+      for (const preset of PRESETS) {
+        const mark = current === preset.name ? ' ● active' : ''
+        ui.append({ kind: 'system', text: `${preset.name}  [sandbox: ${preset.sandbox}, approval: ${preset.approval}] — ${preset.description}${mark}` })
+      }
+      ui.append({ kind: 'system', text: 'usage: /permissions <name> — switch the current session' })
+      return
+    }
+    if (!PRESETS.some(p => p.name === name)) {
+      ui.append({ kind: 'error', text: `unknown preset ${name} (available: ${PRESETS.map(p => p.name).join(', ')})` })
+      return
+    }
+    try {
+      permissionPresets.set(activeAgent.session as never, name)
+      ui.append({ kind: 'system', text: `permissions → ${name}` })
+    } catch (error) {
+      ui.append({ kind: 'error', text: `permissions failed: ${error instanceof Error ? error.message : String(error)}` })
+    }
+  }
+
+  async function planCommand(): Promise<void> {
+    if (planMode === undefined) {
+      ui.append({ kind: 'error', text: 'plan mode is not mounted in this profile' })
+      return
+    }
+    const state = planMode.get(activeAgent as never)
+    const outcome = planMode.set(activeAgent as never, !state.active)
+    const next = planMode.get(activeAgent as never)
+    ui.append({ kind: 'system', text: `plan mode: ${next.active ? 'on' : 'off'}${next.pending === true ? ' (queued for next step)' : ''} [${outcome}]` })
+  }
+
+  async function trajectoryCommand(): Promise<void> {
+    const events = activeAgent.session.events
+    const recent = events.slice(-60)
+    if (recent.length === 0) {
+      ui.append({ kind: 'system', text: 'no events in this session yet' })
+      return
+    }
+    ui.append({ kind: 'system', text: `trajectory (last ${recent.length} of ${events.length} events):` })
+    for (const event of recent) {
+      const summary = trajectoryLine(event)
+      if (summary !== undefined) ui.append({ kind: 'system', text: summary })
+    }
+  }
+
+  /** Compact one-line summary of a session event for /trajectory. */
+  function trajectoryLine(event: SessionEvent): string | undefined {
+    const seq = String(event.seq).padStart(4)
+    const type = event.type as string
+    const data = (event as unknown as { data?: Record<string, unknown> }).data
+    const textOf = (value: unknown): string => {
+      const message = value as { content?: ReadonlyArray<{ type?: string; text?: string }> }
+      return (message.content ?? [])
+        .filter(block => block.type === 'text' && block.text !== undefined)
+        .map(block => block.text ?? '')
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .slice(0, 60)
+    }
+    switch (type) {
+      case 'turn/start': return `${seq} ${typeof data?.turn === 'number' && data.turn > 0 ? `▶ turn ${data.turn}` : '▶ turn'}`
+      case 'turn/end': return `${seq}  ⏹ ${String((data?.reason as { kind?: string } | undefined)?.kind ?? '')}`
+      case 'user/message': return `${seq}  ❯ ${textOf(data)}`
+      case 'assistant/message': return `${seq}  ● ${textOf(data?.message)}`
+      case 'tool/call': return `${seq}  ⏱ ${String(data?.name ?? 'tool')} ${String(data?.arguments ?? '').replace(/\s+/g, ' ').slice(0, 40)}`
+      case 'tool/result': return `${seq}  ${data?.error !== undefined ? '✖' : '✓'} ${data?.error !== undefined ? String((data.error as { code?: string }).code ?? 'error') : 'ok'}`
+      case 'permission/preset': return `${seq}  🔒 permission → ${String(data?.preset ?? '')}`
+      case 'sandbox/mode': return `${seq}  🗄 sandbox → ${String(data?.mode ?? '')}`
+      case 'plan/mode': return `${seq}  📝 plan mode ${data?.active === true ? 'on' : 'off'}`
+      case 'goal/change': return `${seq}  🎯 goal change`
+      case 'todo/write': return `${seq}  ☑ todos ${Array.isArray(data?.todos) ? data.todos.length : 0}`
+      case 'compaction/end': return `${seq}  🗜 compacted`
+      case 'subagent/descriptor': return `${seq}  🤖 subagent`
+      case 'approval/asked': return `${seq}  ❓ approval requested`
+      case 'approval/decided': return `${seq}  ✅ approval decided`
+      default: return undefined
+    }
+  }
 
   const commands: TuiCommand[] = [
     {
       name: 'help',
       usage: '',
       help: 'show this help',
-      handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /resume /compact /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }),
+      handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /resume /compact /permissions /plan /trajectory /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }),
     },
     { name: 'clear', usage: '', help: 'clear the conversation area', handler: () => ui.clearLog() },
     { name: 'model', usage: '[id] [effort]', help: 'list models + reasoning efforts; switch live', handler: args => void modelCommand(args) },
     { name: 'resume', usage: '[n]', help: 'list persisted sessions; continue one', handler: args => void resumeCommand(args) },
     { name: 'compact', usage: '', help: 'compact the conversation now', handler: () => void compactCommand() },
-    { name: 'status', usage: '', help: 'show session and workspace info', handler: () => ui.append({ kind: 'system', text: `session: ${activeAgent.session.id} · cwd: ${process.cwd()} · events: ${activeAgent.session.events.length}` }) },
+    { name: 'permissions', usage: '[name]', help: 'list/switch read-only, workspace-write, full access', handler: args => void permissionsCommand(args) },
+    { name: 'plan', usage: '', help: 'toggle plan mode (next step)', handler: () => void planCommand() },
+    { name: 'trajectory', usage: '', help: 'show the session event timeline', handler: () => void trajectoryCommand() },
+    { name: 'status', usage: '', help: 'show session and workspace info', handler: () => ui.append({ kind: 'system', text: `session: ${activeAgent.session.id} · cwd: ${process.cwd()} · events: ${activeAgent.session.events.length} · turns: ${turnCount}` }) },
     {
       name: 'reasoning',
       usage: 'on|off',
@@ -484,6 +586,8 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
         ui.setBusy(true)
         try {
           await runTurn(activeAgent, ui, sessions, line, streaming)
+          turnCount += 1
+          ui.setStatus(status())
         } finally {
           ui.setBusy(false)
         }

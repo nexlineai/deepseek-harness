@@ -36,6 +36,12 @@
       "path": "../../compaction/compaction"
     },
     {
+      "path": "../../interaction/permission-presets"
+    },
+    {
+      "path": "../../plan/plan-mode"
+    },
+    {
       "path": "../../runtime-diagnostics/invariants"
     },
     {
