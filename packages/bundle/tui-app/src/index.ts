@@ -4,9 +4,15 @@
  * one Agent through the core registry and drives a full-screen
  * Claude Code / opencode-style surface (see ./ui.ts): conversation scrollback,
  * fixed input bar with prompt history and slash-command completion, status
- * bar, and live token streaming via `assistant/chunk` text deltas.
+ * bar, live token streaming, reasoning blocks, and tool-call cards.
  *
- * Slash commands: /help /exit /quit /clear /model /status /stream on|off
+ * Slash commands:
+ *   /help /exit /quit /clear /status
+ *   /model [id] [effort]   list models and reasoning efforts; switch live
+ *   /resume [n|id]         list persisted sessions; continue one
+ *   /compact               compact the conversation now
+ *   /reasoning on|off      show or hide the thinking display
+ *   /stream on|off         toggle live token streaming
  *
  * @module @deepseek-ai/dsh-tui-app
  */
@@ -15,11 +21,13 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
-import type { ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import type { ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-session-query'
+import type {} from '@deepseek-ai/dsh-compaction'
 import { Tui, type TuiCommand } from './ui.ts'
 // Empty type imports carry the loader Context merge for the settlement await
 // and the cmdline Context merge for the appExit host value.
@@ -30,7 +38,7 @@ import type {} from '@deepseek-ai/dsh-cmdline'
 export const name = 'tui-runner'
 
 /** Core services required before the interactive turn can start. */
-export const inject = ['agentDefaultModel', 'agents', 'sessions']
+export const inject = ['agentDefaultModel', 'agents', 'sessions', 'sessionQuery', 'compaction']
 
 /** Plugin config: the seed task and stream mode resolved from the startup provider. */
 export interface Config {
@@ -89,11 +97,6 @@ function summarize(events: readonly SessionEvent[], firstSeq: number): { text: s
  * Run one turn against `agent`, streaming chunks into the UI and reporting
  * tool activity and the final outcome. Prints the aggregate answer only when
  * nothing was streamed (e.g. streaming disabled).
- * @param agent - the live agent to drive.
- * @param ui - the terminal surface.
- * @param sessions - session store, for the durability flush.
- * @param prompt - the user prompt text.
- * @param streaming - render text deltas live.
  */
 async function runTurn(
   agent: TuiAgent,
@@ -189,12 +192,27 @@ function previewResult(message: unknown): string {
   return '(result)'
 }
 
+/** One catalog entry for the /model picker. */
+interface CatalogModel {
+  provider: string
+  providerName: string
+  id: string
+  name: string
+  description?: string
+  efforts: string[]
+  defaultEffort?: string
+}
+
+/** One entry for the /resume picker. */
+interface SessionPick {
+  id: string
+  title: string
+  createdAt: string
+  live: boolean
+}
+
 /**
  * Run the interactive REPL through the full-screen surface.
- * @param ctx - plugin context carrying core services and the launcher exit request.
- * @param io - process-facing effects.
- * @param seed - optional boot-time task.
- * @param streaming - initial stream mode.
  */
 async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): Promise<void> {
   // Loader siblings mount concurrently. Await the complete application before
@@ -203,32 +221,225 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
   const agents = ctx.get('agents')
   const defaultModel = ctx.get('agentDefaultModel')
   const sessions = ctx.get('sessions')
+  const sessionQuery = ctx.get('sessionQuery')
+  const compaction = ctx.get('compaction')
+  const llm = ctx.get('llm')
   // Early process shutdown can dispose the tree while settlement is pending.
   if (agents === undefined || defaultModel === undefined || sessions === undefined) return
+  // Capture narrowed services so hoisted closures below keep them defined.
+  const agentsSvc = agents
+  const defaultModelSvc = defaultModel
+  const sessionsSvc = sessions
 
-  const selection = defaultModel.currentSelection()
-  const { agent } = await agents.create({
+  const selection = defaultModelSvc.currentSelection()
+  // Shared mutable selection: every agent (boot and resumed) reads it per
+  // request, so /model switches apply to the very next turn, live.
+  const selected: ModelSelectionRef = { current: selection, assembled: undefined }
+
+  const createHandle = await agentsSvc.create({
     sessionId: SessionId(`session-${randomUUID()}`),
     meta: { cwd: process.cwd() },
     agentOptions: { provider: selection.provider, model: selection.model },
     setup: (agentCtx) => {
-      const selected: ModelSelectionRef = { current: selection, assembled: undefined }
       installModelSelection(agentCtx, selected)
     },
   })
-  await agent.whenIdle()
+  await createHandle.agent.whenIdle()
 
-  const sessionId = agent.session.id ?? '?'
-  const shortId = sessionId.replace(/^session-/, '').slice(0, 8)
+  // The active agent (mutable across /resume) and its disposer.
+  let activeAgent: TuiAgent = createHandle.agent as unknown as TuiAgent
+  let disposeActive: (() => void) | undefined = () => createHandle.dispose()
+
+  // Caches for the /resume and /model pickers (indexes map into these).
+  let sessionPicks: SessionPick[] = []
+  let catalog: CatalogModel[] = []
+
   const cwd = process.cwd()
-  const header = (): string => `${selection.provider}/${selection.model} · session ${shortId}`
+  const headerText = (): string => {
+    const sel = selected.current ?? selection
+    return `${sel.provider}/${sel.model} · session ${activeSessionShort()}`
+  }
+  const activeSessionShort = (): string => (activeAgent.session.id ?? '?').replace(/^session-/, '').slice(0, 8)
   const status = (): string => `${cwd} · ${streaming ? 'stream on' : 'stream off'}`
 
+  // ── /model ────────────────────────────────────────────────────────────────
+
+  async function buildCatalog(): Promise<CatalogModel[]> {
+    const result: CatalogModel[] = []
+    const providers = llm?.listProviders() ?? []
+    for (const provider of providers) {
+      let models
+      try {
+        models = await llm?.listModels(provider.id)
+      } catch {
+        continue
+      }
+      for (const model of models ?? []) {
+        let resolved
+        try {
+          resolved = await llm?.resolveModelInfo(provider.id, model.id)
+        } catch {
+          resolved = undefined
+        }
+        result.push({
+          provider: provider.id,
+          providerName: provider.name ?? provider.id,
+          id: model.id,
+          name: model.name ?? model.id,
+          ...(model.description !== undefined && { description: model.description }),
+          efforts: (resolved?.reasoning?.efforts ?? []).map(effort => String(effort.id)),
+          ...(resolved?.reasoning?.defaultEffort !== undefined && { defaultEffort: String(resolved.reasoning.defaultEffort) }),
+        })
+      }
+    }
+    return result
+  }
+
+  async function modelCommand(args: string): Promise<void> {
+    if (args.trim() === '') {
+      ui.append({ kind: 'system', text: 'loading model catalog…' })
+      catalog = await buildCatalog()
+      if (catalog.length === 0) {
+        ui.append({ kind: 'error', text: 'no models discovered (is the llm adapter mounted?)' })
+        return
+      }
+      const current = selected.current
+      for (const m of catalog) {
+        const mark = current !== undefined && m.provider === current.provider && m.id === current.model ? ' ● active' : ''
+        const efforts = m.efforts.length > 0 ? ` [reasoning: ${m.efforts.join('/')}]` : ''
+        ui.append({ kind: 'system', text: `${m.id}  (${m.providerName})${efforts}${mark}` })
+      }
+      ui.append({ kind: 'system', text: 'usage: /model <id> — switch now; /model <id> <effort> — switch + set reasoning effort' })
+      return
+    }
+    const [modelArg, effortArg] = args.split(/\s+/)
+    if (catalog.length === 0) catalog = await buildCatalog()
+    const found = catalog.find(m => m.id === modelArg)
+    if (found === undefined) {
+      ui.append({ kind: 'error', text: `model ${modelArg} not found — run /model to list available models` })
+      return
+    }
+    const next: ModelSelection = effortArg !== undefined
+      ? {
+        provider: found.provider,
+        model: found.id,
+        reasoningEffort: ReasoningEffortId(effortArg.toLowerCase()),
+      }
+      : { provider: found.provider, model: found.id }
+    if (effortArg !== undefined && !found.efforts.includes(effortArg.toLowerCase())) {
+      ui.append({ kind: 'error', text: `effort ${effortArg} not advertised for ${found.id} (available: ${found.efforts.join('/') || 'unknown'})` })
+    }
+    selected.current = next
+    // Persist as the default for future sessions.
+    try {
+      await defaultModelSvc.saveSelection(next)
+    } catch {
+      // Non-fatal: the live switch already took effect.
+    }
+    ui.append({ kind: 'system', text: `model → ${found.id}${next.reasoningEffort !== undefined ? ` (reasoning ${next.reasoningEffort})` : ''}` })
+    ui.setHeader(headerText())
+  }
+
+  // ── /resume ───────────────────────────────────────────────────────────────
+
+  async function resumeCommand(args: string): Promise<void> {
+    if (sessionQuery === undefined) {
+      ui.append({ kind: 'error', text: 'session browsing is not mounted in this profile' })
+      return
+    }
+    const target = args.trim()
+    if (target === '') {
+      ui.append({ kind: 'system', text: 'loading sessions…' })
+      const records = await sessionQuery.listSessions()
+      const sorted = [...records].sort((a, b) => b.header.createdAt - a.header.createdAt)
+      sessionPicks = []
+      for (const record of sorted.slice(0, 15)) {
+        const title = (await sessionQuery.readTitle(record.header.id).catch(() => undefined))?.title ?? '(untitled)'
+        const date = new Date(record.header.createdAt).toISOString().slice(0, 16).replace('T', ' ')
+        sessionPicks.push({ id: record.header.id, title, createdAt: date, live: record.live })
+      }
+      if (sessionPicks.length === 0) {
+        ui.append({ kind: 'system', text: 'no persisted sessions found' })
+        return
+      }
+      sessionPicks.forEach((pick, i) => {
+        const mark = pick.live ? ' ● live' : ''
+        ui.append({ kind: 'system', text: `${String(i + 1).padStart(2)}  ${pick.createdAt}  ${pick.id.replace(/^session-/, '').slice(0, 8)}  ${pick.title}${mark}` })
+      })
+      ui.append({ kind: 'system', text: 'usage: /resume <number> — continue that session' })
+      return
+    }
+    if (sessionPicks.length === 0) {
+      ui.append({ kind: 'error', text: 'run /resume first to list sessions, then /resume <number>' })
+      return
+    }
+    const pick = /^\d+$/.test(target)
+      ? sessionPicks[Number(target) - 1]
+      : sessionPicks.find(p => p.id.startsWith(target) || p.id.includes(target))
+    if (pick === undefined) {
+      ui.append({ kind: 'error', text: `no session matches ${target}` })
+      return
+    }
+    ui.append({ kind: 'system', text: `resuming session ${pick.id.replace(/^session-/, '').slice(0, 8)}…` })
+    try {
+      const handle = await agentsSvc.resume({
+        resumeSessionId: SessionId(pick.id),
+        ...(selected.current !== undefined && {
+          agentOptions: { provider: selected.current.provider, model: selected.current.model },
+        }),
+        setup: (agentCtx) => {
+          installModelSelection(agentCtx, selected)
+        },
+      })
+      await handle.agent.whenIdle()
+      await sessionsSvc.flush(activeAgent.session as never)
+      disposeActive?.()
+      disposeActive = () => handle.dispose()
+      activeAgent = handle.agent as unknown as TuiAgent
+      ui.append({ kind: 'system', text: `resumed ${pick.id.replace(/^session-/, '').slice(0, 8)} — ${pick.title}` })
+      ui.setHeader(headerText())
+    } catch (error) {
+      ui.append({ kind: 'error', text: `resume failed: ${error instanceof Error ? error.message : String(error)}` })
+    }
+  }
+
+  // ── /compact ──────────────────────────────────────────────────────────────
+
+  async function compactCommand(): Promise<void> {
+    if (compaction === undefined) {
+      ui.append({ kind: 'error', text: 'compaction is not mounted in this profile' })
+      return
+    }
+    ui.append({ kind: 'system', text: 'compacting conversation…' })
+    try {
+      const result = await compaction.compactNow(activeAgent as never, new AbortController().signal)
+      if (result === null) {
+        ui.append({ kind: 'system', text: 'nothing to compact (history too short)' })
+        return
+      }
+      ui.append({ kind: 'system', text: `compacted: ${result.shadowedSeqs.length} events shadowed (~${result.shadowedTokenCount} tokens)` })
+    } catch (error) {
+      const code = (error as { code?: string }).code
+      ui.append({ kind: 'error', text: `compact failed${code !== undefined ? ` (${code})` : ''}: ${error instanceof Error ? error.message : String(error)}` })
+    }
+  }
+
+  // ── command table ─────────────────────────────────────────────────────────
+
+  let showReasoning = true
+
   const commands: TuiCommand[] = [
-    { name: 'help', usage: '', help: 'show this help', handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }) },
+    {
+      name: 'help',
+      usage: '',
+      help: 'show this help',
+      handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /resume /compact /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }),
+    },
     { name: 'clear', usage: '', help: 'clear the conversation area', handler: () => ui.clearLog() },
-    { name: 'model', usage: '', help: 'show the active model', handler: () => ui.append({ kind: 'system', text: `model: ${selection.provider}/${selection.model}` }) },
-    { name: 'status', usage: '', help: 'show session and workspace info', handler: () => ui.append({ kind: 'system', text: `session: ${sessionId} · cwd: ${process.cwd()} · events: ${agent.session.events.length}` }) },
+    { name: 'model', usage: '[id] [effort]', help: 'list models + reasoning efforts; switch live', handler: args => void modelCommand(args) },
+    { name: 'resume', usage: '[n]', help: 'list persisted sessions; continue one', handler: args => void resumeCommand(args) },
+    { name: 'compact', usage: '', help: 'compact the conversation now', handler: () => void compactCommand() },
+    { name: 'status', usage: '', help: 'show session and workspace info', handler: () => ui.append({ kind: 'system', text: `session: ${activeAgent.session.id} · cwd: ${process.cwd()} · events: ${activeAgent.session.events.length}` }) },
     {
       name: 'reasoning',
       usage: 'on|off',
@@ -263,18 +474,16 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     { name: 'quit', usage: '', help: 'leave the session', handler: () => ui.requestExit() },
   ]
 
-  let showReasoning = true
-
   const ui = new Tui({
     commands,
-    header: header(),
+    header: headerText(),
     status: status(),
     onPrompt: (line) => {
       void (async () => {
         ui.append({ kind: 'user', text: line })
         ui.setBusy(true)
         try {
-          await runTurn(agent, ui, sessions, line, streaming)
+          await runTurn(activeAgent, ui, sessions, line, streaming)
         } finally {
           ui.setBusy(false)
         }
