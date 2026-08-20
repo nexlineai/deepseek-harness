@@ -793,7 +793,9 @@ export class Tui {
     const busyMark = this.busy ? ` ${SPINNER[this.spinnerFrame]}` : ''
     const right = `${this.buffer.startsWith('/') ? '' : '/help'}${busyMark}`
     const pad = Math.max(1, cols - width(left) - width(right))
-    return `${ANSI.eraseLine}${ANSI.dim}${left}${' '.repeat(pad)}${right}${ANSI.reset}\n`
+    // No trailing newline: this row is the last one on screen, and a newline
+    // would scroll the whole terminal.
+    return `${ANSI.eraseLine}${ANSI.dim}${left}${' '.repeat(pad)}${right}${ANSI.reset}`
   }
 
   private renderStatusLine(): void {

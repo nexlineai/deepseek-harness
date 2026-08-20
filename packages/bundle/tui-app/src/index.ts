@@ -253,6 +253,7 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
         if (arg === 'on' || arg === 'off') {
           streaming = arg === 'on'
           ui.append({ kind: 'system', text: `streaming: ${streaming ? 'on' : 'off'}` })
+          ui.setStatus(status())
         } else {
           ui.append({ kind: 'system', text: `usage: /stream on|off (current: ${streaming ? 'on' : 'off'})` })
         }
