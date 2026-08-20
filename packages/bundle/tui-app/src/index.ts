@@ -481,15 +481,22 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
 
   async function trajectoryCommand(): Promise<void> {
     const events = activeAgent.session.events
-    const recent = events.slice(-60)
+    const recent = events.slice(-200)
     if (recent.length === 0) {
       ui.append({ kind: 'system', text: 'no events in this session yet' })
       return
     }
-    ui.append({ kind: 'system', text: `trajectory (last ${recent.length} of ${events.length} events):` })
+    let shown = 0
     for (const event of recent) {
       const summary = trajectoryLine(event)
-      if (summary !== undefined) ui.append({ kind: 'system', text: summary })
+      if (summary !== undefined) {
+        ui.append({ kind: 'system', text: summary })
+        shown += 1
+        if (shown >= 80) {
+          ui.append({ kind: 'system', text: '… more events above — scroll up (PgUp / mouse wheel)' })
+          break
+        }
+      }
     }
   }
 
@@ -510,7 +517,13 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     switch (type) {
       case 'turn/start': return `${seq} ${typeof data?.turn === 'number' && data.turn > 0 ? `▶ turn ${data.turn}` : '▶ turn'}`
       case 'turn/end': return `${seq}  ⏹ ${String((data?.reason as { kind?: string } | undefined)?.kind ?? '')}`
-      case 'user/message': return `${seq}  ❯ ${textOf(data)}`
+      case 'user/message': {
+        const text = textOf(data)
+        // Skip injected system reminders / context snapshots.
+        const noise = /^<system-reminder>|^Current runtime context|^A skill is a reusable|^The following workspace instructions/
+        if (noise.test(text)) return undefined
+        return `${seq}  ❯ ${text}`
+      }
       case 'assistant/message': return `${seq}  ● ${textOf(data?.message)}`
       case 'tool/call': return `${seq}  ⏱ ${String(data?.name ?? 'tool')} ${String(data?.arguments ?? '').replace(/\s+/g, ' ').slice(0, 40)}`
       case 'tool/result': return `${seq}  ${data?.error !== undefined ? '✖' : '✓'} ${data?.error !== undefined ? String((data.error as { code?: string }).code ?? 'error') : 'ok'}`

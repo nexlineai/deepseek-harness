@@ -276,6 +276,8 @@ export class Tui {
       process.stdin.resume()
       this.raw = process.stdin
       process.stdin.on('data', (buf: Buffer) => this.onData(buf))
+      // Enable mouse reporting (SGR) so the wheel scrolls the conversation.
+      process.stdout.write('\x1b[?1000h\x1b[?1006h')
     } else {
       // Piped stdin (tests, scripts): plain line reads, no editing surface.
       this.rl = createInterface({ input: process.stdin, output: process.stdout })
@@ -287,7 +289,7 @@ export class Tui {
 
   /** Leave the alternate screen and restore the terminal. */
   restore(): void {
-    process.stdout.write(ANSI.altLeave + ANSI.showCursor)
+    process.stdout.write(ANSI.altLeave + ANSI.showCursor + '\x1b[?1000l\x1b[?1006l')
   }
 
   /** Append a conversation entry, snap scrollback to the bottom, and redraw. */
@@ -455,6 +457,13 @@ export class Tui {
       return
     }
     const code = seq.slice(2) // strip ESC [
+    // SGR mouse reporting: ESC[<button;x;yM (button 64 = wheel up, 65 = down).
+    if (code.startsWith('<') && code.endsWith('M')) {
+      const button = Number(code.slice(1, -1).split(';')[0])
+      if (button === 64) this.scrollPage(1)
+      else if (button === 65) this.scrollPage(-1)
+      return
+    }
     if (code === 'A') this.historyPrev()
     else if (code === 'B') this.historyNext()
     else if (code === 'C') this.cursor = Math.min(this.cursor + 1, this.buffer.length)
@@ -737,6 +746,8 @@ export class Tui {
     }
 
     // Scrollback: `scroll` rows hidden from the bottom.
+    const maxScroll = Math.max(0, styled.length - logRows)
+    this.scroll = Math.min(this.scroll, maxScroll)
     const start = Math.max(0, styled.length - logRows - this.scroll)
     const visible = styled.slice(start, styled.length - this.scroll)
 
