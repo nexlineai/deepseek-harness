@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
-import type { ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import type { Agent, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
@@ -63,14 +63,6 @@ interface TuiIo {
   exit(code: number): void
 }
 
-/** The subset of an Agent the REPL drives. */
-interface TuiAgent {
-  session: { seq: number; events: readonly SessionEvent[]; id?: string }
-  ctx: { on(event: 'session/event', listener: (session: unknown, event: SessionEvent) => void): () => void }
-  followup(message: unknown): void
-  whenIdle(): Promise<void>
-}
-
 /** Aggregate the final assistant text and turn outcome in one owned interval. */
 function summarize(events: readonly SessionEvent[], firstSeq: number): { text: string; reason: SessionEvent<'turn/end'>['data']['reason'] | undefined } {
   let started = false
@@ -101,9 +93,9 @@ function summarize(events: readonly SessionEvent[], firstSeq: number): { text: s
  * nothing was streamed (e.g. streaming disabled).
  */
 async function runTurn(
-  agent: TuiAgent,
+  agent: Agent,
   ui: Tui,
-  sessions: { flush(session: unknown): Promise<unknown> },
+  sessions: { flush(session: Agent['session']): Promise<unknown> },
   prompt: string,
   streaming: boolean,
 ): Promise<void> {
@@ -252,8 +244,8 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
   await createHandle.agent.whenIdle()
 
   // The active agent (mutable across /resume) and its disposer.
-  let activeAgent: TuiAgent = createHandle.agent as unknown as TuiAgent
-  let disposeActive: (() => void) | undefined = () => createHandle.dispose()
+  let activeAgent: Agent = createHandle.agent
+  let disposeActive: (() => void | Promise<void>) | undefined = () => createHandle.dispose()
 
   // Caches for the /resume and /model pickers (indexes map into these).
   let sessionPicks: SessionPick[] = []
@@ -397,10 +389,10 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
         },
       })
       await handle.agent.whenIdle()
-      await sessionsSvc.flush(activeAgent.session as never)
+      await sessionsSvc.flush(activeAgent.session)
       disposeActive?.()
       disposeActive = () => handle.dispose()
-      activeAgent = handle.agent as unknown as TuiAgent
+      activeAgent = handle.agent
       ui.append({ kind: 'system', text: `resumed ${pick.id.replace(/^session-/, '').slice(0, 8)} — ${pick.title}` })
       ui.setHeader(headerText())
     } catch (error) {
@@ -417,7 +409,7 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     }
     ui.append({ kind: 'system', text: 'compacting conversation…' })
     try {
-      const result = await compaction.compactNow(activeAgent as never, new AbortController().signal)
+      const result = await compaction.compactNow(activeAgent, new AbortController().signal)
       if (result === null) {
         ui.append({ kind: 'system', text: 'nothing to compact (history too short)' })
         return
@@ -448,7 +440,7 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     }
     const name = args.trim().toLowerCase()
     if (name === '') {
-      const current = permissionPresets.current(activeAgent.session.events as never)
+      const current = permissionPresets.current(activeAgent.session.events)
       for (const preset of PRESETS) {
         const mark = current === preset.name ? ' ● active' : ''
         ui.append({ kind: 'system', text: `${preset.name}  [sandbox: ${preset.sandbox}, approval: ${preset.approval}] — ${preset.description}${mark}` })
@@ -461,7 +453,7 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
       return
     }
     try {
-      permissionPresets.set(activeAgent.session as never, name)
+      permissionPresets.set(activeAgent.session, name)
       ui.append({ kind: 'system', text: `permissions → ${name}` })
     } catch (error) {
       ui.append({ kind: 'error', text: `permissions failed: ${error instanceof Error ? error.message : String(error)}` })
@@ -473,9 +465,9 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
       ui.append({ kind: 'error', text: 'plan mode is not mounted in this profile' })
       return
     }
-    const state = planMode.get(activeAgent as never)
-    const outcome = planMode.set(activeAgent as never, !state.active)
-    const next = planMode.get(activeAgent as never)
+    const state = planMode.get(activeAgent)
+    const outcome = planMode.set(activeAgent, !state.active)
+    const next = planMode.get(activeAgent)
     ui.append({ kind: 'system', text: `plan mode: ${next.active ? 'on' : 'off'}${next.pending === true ? ' (queued for next step)' : ''} [${outcome}]` })
   }
 
