@@ -39,6 +39,8 @@ export interface TuiEntry {
   text: string
   /** Tool name (kind 'tool'). */
   name?: string
+  /** Tool call identity (kind 'tool'), used to match the matching result. */
+  callId?: string
   /** Tool lifecycle marker. */
   status?: 'running' | 'done' | 'error'
   /** Tool args / output preview lines. */
@@ -85,9 +87,45 @@ const BOX = {
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
-/** Visible width of a string, ignoring ANSI escape sequences. */
-function width(text: string): number {
-  return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').length
+/** Maximum conversation entries kept on screen; older ones scroll out of memory. */
+const MAX_ENTRIES = 2000
+
+/**
+ * Terminal cell width of one code point. Covers the ranges that actually show
+ * up in agent output: CJK, Hangul, kana, fullwidth forms, and the emoji /
+ * pictograph blocks used by the tool cards and trajectory markers.
+ */
+function charWidth(code: number): number {
+  // Combining marks and zero-width joiners occupy no cell of their own.
+  if (code === 0x200d || (code >= 0x0300 && code <= 0x036f) || code === 0xfe0f || code === 0xfe0e) return 0
+  if (
+    (code >= 0x1100 && code <= 0x115f) // Hangul Jamo
+    || (code >= 0x2e80 && code <= 0x303e) // CJK radicals, Kangxi
+    || (code >= 0x3041 && code <= 0x33ff) // kana, CJK compatibility
+    || (code >= 0x3400 && code <= 0x4dbf) // CJK ext A
+    || (code >= 0x4e00 && code <= 0x9fff) // CJK unified
+    || (code >= 0xa000 && code <= 0xa4cf) // Yi
+    || (code >= 0xac00 && code <= 0xd7a3) // Hangul syllables
+    || (code >= 0xf900 && code <= 0xfaff) // CJK compatibility ideographs
+    || (code >= 0xfe30 && code <= 0xfe6f) // CJK compatibility forms
+    || (code >= 0xff00 && code <= 0xff60) // fullwidth forms
+    || (code >= 0xffe0 && code <= 0xffe6)
+    || (code >= 0x1f300 && code <= 0x1f64f) // pictographs, emoticons
+    || (code >= 0x1f900 && code <= 0x1f9ff) // supplemental symbols
+    || (code >= 0x20000 && code <= 0x3fffd) // CJK ext B+
+  ) return 2
+  return 1
+}
+
+/** Visible width of a string in terminal cells, ignoring ANSI escape sequences. */
+export function width(text: string): number {
+  const plain = text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+  let total = 0
+  for (const char of plain) {
+    const code = char.codePointAt(0)
+    if (code !== undefined) total += charWidth(code)
+  }
+  return total
 }
 
 /** Pad `text` with spaces so its ANSI-free width is `w`. */
@@ -96,10 +134,46 @@ function padRight(text: string, w: number): string {
   return missing > 0 ? text + ' '.repeat(missing) : text
 }
 
+/**
+ * Split `text` at the last code point that still fits in `cols` cells.
+ * Slicing by cell width (not code units) keeps wide glyphs from overflowing.
+ */
+function splitAtWidth(text: string, cols: number): [string, string] {
+  let taken = ''
+  let used = 0
+  for (const char of text) {
+    const w = charWidth(char.codePointAt(0) ?? 0)
+    if (used + w > cols) break
+    taken += char
+    used += w
+  }
+  // Guarantee forward progress even if a single glyph exceeds the pane.
+  // Iterating yields whole code points, so a surrogate pair is never split.
+  if (taken === '') {
+    let first = ''
+    for (const char of text) {
+      first = char
+      break
+    }
+    return [first, text.slice(first.length)]
+  }
+  return [taken, text.slice(taken.length)]
+}
+
 /** Word-boundary wrap (hard-break long words), ANSI-free input. */
-function wrapWords(text: string, cols: number): string[] {
+export function wrapWords(text: string, cols: number): string[] {
   if (cols <= 0) return [text]
   const lines: string[] = []
+  /** Emit a line, hard-breaking it first if it overflows the pane. */
+  const flush = (line: string): void => {
+    let rest = line
+    while (width(rest) > cols) {
+      const [head, tail] = splitAtWidth(rest, cols)
+      lines.push(head)
+      rest = tail
+    }
+    lines.push(rest.trimEnd())
+  }
   for (const raw of text.split('\n')) {
     if (raw === '') {
       lines.push('')
@@ -109,18 +183,13 @@ function wrapWords(text: string, cols: number): string[] {
     for (const word of raw.split(/(?<=\s)/)) {
       const candidate = line + word
       if (width(candidate) > cols && line.trim() !== '') {
-        lines.push(line.trimEnd())
+        flush(line)
         line = word.trimStart()
-        // Hard-break overlong words.
-        while (width(line) > cols) {
-          lines.push(line.slice(0, cols))
-          line = line.slice(cols)
-        }
       } else {
         line = candidate
       }
     }
-    lines.push(line.trimEnd())
+    flush(line)
   }
   return lines
 }
@@ -297,8 +366,20 @@ export class Tui {
     if (this.exited) return
     if (entry.kind === 'assistant') this.pushPending()
     this.entries.push(entry)
+    this.trim()
     if (this.scroll > 0 && entry.kind !== 'separator') this.scroll = 0
     this.render()
+  }
+
+  /**
+   * Bound the scrollback. Every entry is re-styled on each frame — and the
+   * spinner redraws ~10×/s — so an unbounded log makes long sessions get
+   * progressively slower. The session itself remains complete on disk;
+   * only the on-screen backlog is capped.
+   */
+  private trim(): void {
+    const overflow = this.entries.length - MAX_ENTRIES
+    if (overflow > 0) this.entries.splice(0, overflow)
   }
 
   /** Begin a streaming response: clear pending assistant + reasoning lines. */
@@ -351,6 +432,11 @@ export class Tui {
     }
   }
 
+  /** Read-only snapshot of the conversation log (diagnostics and tests). */
+  log(): readonly TuiEntry[] {
+    return this.entries
+  }
+
   /** Toggle reasoning display. */
   setShowReasoning(show: boolean): void {
     this.showReasoning = show
@@ -370,15 +456,23 @@ export class Tui {
     return { in: this.tokensIn, out: this.tokensOut }
   }
 
-  /** Update the most recent tool entry's lifecycle state. */
-  updateLastTool(status: 'done' | 'error', detail?: string): void {
+  /**
+   * Update a tool entry's lifecycle state. When `callId` is given the matching
+   * card is patched, so results arriving out of order across parallel tool
+   * calls land on the right card; without one the most recent running tool is
+   * used as a fallback.
+   */
+  updateTool(status: 'done' | 'error', detail?: string, callId?: string): void {
     for (let i = this.entries.length - 1; i >= 0; i -= 1) {
       const entry = this.entries[i]
-      if (entry !== undefined && entry.kind === 'tool') {
-        entry.status = status
-        if (detail !== undefined && detail !== '') entry.detail = detail
-        break
-      }
+      if (entry === undefined || entry.kind !== 'tool') continue
+      const matches = callId !== undefined
+        ? entry.callId === callId
+        : entry.status === 'running'
+      if (!matches) continue
+      entry.status = status
+      if (detail !== undefined && detail !== '') entry.detail = detail
+      break
     }
     this.render()
   }
@@ -627,6 +721,7 @@ export class Tui {
       this.entries.push({ kind: 'assistant', text: this.pendingText })
       this.pendingText = ''
     }
+    this.trim()
   }
 
   private queueRender(): void {
@@ -707,7 +802,10 @@ export class Tui {
         : `${ANSI.yellow}${SPINNER[this.spinnerFrame]} running${ANSI.reset}`
     const rows: LogRow[] = []
     // Top border: ┌─ title ───────────────┐
-    rows.push({ text: `${ANSI.grey}${BOX.tl}${BOX.h} ${title}${ANSI.reset}${ANSI.grey}${' '.repeat(Math.max(0, inner - title.length - 1))}${BOX.h}${BOX.tr}${ANSI.reset}`, w: cols })
+    // Fill is measured in cells (width), never code units, so wide glyphs in a
+    // tool name keep the right edge aligned.
+    const titleFill = Math.max(0, inner - width(title) - 1)
+    rows.push({ text: `${ANSI.grey}${BOX.tl}${BOX.h} ${title}${ANSI.reset}${ANSI.grey}${BOX.h.repeat(titleFill)}${BOX.h}${BOX.tr}${ANSI.reset}`, w: cols })
     const detailLines = wrapWords(entry.detail ?? '', inner)
     for (const detail of detailLines.slice(0, 5)) {
       rows.push({ text: `${ANSI.grey}${BOX.v}${ANSI.reset} ${padRight(detail, inner)}${ANSI.grey}${BOX.v}${ANSI.reset}`, w: cols })
@@ -717,7 +815,10 @@ export class Tui {
       rows.push({ text: `${ANSI.grey}${BOX.v}${ANSI.reset} ${padRight(more, inner)}${ANSI.grey}${BOX.v}${ANSI.reset}`, w: cols })
     }
     // Bottom border: └─ ✓ done ───────────┘
-    rows.push({ text: `${ANSI.grey}${BOX.bl}${BOX.h} ${statusMark}${ANSI.reset}${ANSI.grey}${' '.repeat(Math.max(0, inner - 7))}${BOX.h}${BOX.br}${ANSI.reset}`, w: cols })
+    // The status text varies in length (`✓ done` / `✖ error` / `⠋ running`), so
+    // the fill must be derived from it rather than a fixed constant.
+    const statusFill = Math.max(0, inner - width(statusMark) - 1)
+    rows.push({ text: `${ANSI.grey}${BOX.bl}${BOX.h} ${statusMark}${ANSI.reset}${ANSI.grey}${BOX.h.repeat(statusFill)}${BOX.h}${BOX.br}${ANSI.reset}`, w: cols })
     return rows
   }
 

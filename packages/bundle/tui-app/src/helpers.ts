@@ -36,6 +36,22 @@ export function previewArgs(args: string): string {
   return flat === '' ? '(no arguments)' : flat.slice(0, 120)
 }
 
+/**
+ * The call identity a tool result belongs to, read from its `tool-result`
+ * block. Returns undefined for shapes that carry no identity, which lets the
+ * UI fall back to the most recent running card.
+ */
+export function resultCallId(message: unknown): string | undefined {
+  const content = (message as { content?: unknown } | null | undefined)?.content
+  if (!Array.isArray(content)) return undefined
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue
+    const id = (block as { toolCallId?: unknown }).toolCallId
+    if (typeof id === 'string' && id !== '') return id
+  }
+  return undefined
+}
+
 /** Compact preview of a tool result message. */
 export function previewResult(message: unknown): string {
   try {

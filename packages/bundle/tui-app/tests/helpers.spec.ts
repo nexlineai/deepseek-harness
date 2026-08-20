@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
-import { previewArgs, previewResult, summarize, trajectoryLine } from '../src/helpers.ts'
+import { previewArgs, previewResult, resultCallId, summarize, trajectoryLine } from '../src/helpers.ts'
 
 /** Build a minimal event-shaped value; only the fields each helper reads matter. */
 function ev(partial: Record<string, unknown>): SessionEvent {
@@ -35,6 +35,21 @@ describe('previewResult', () => {
   it('falls back to a marker for unknown shapes', () => {
     expect(previewResult({})).toBe('(result)')
     expect(previewResult(null)).toBe('(result)')
+  })
+})
+
+describe('resultCallId', () => {
+  it('reads the call identity from a tool-result block', () => {
+    const message = { content: [{ type: 'tool-result', toolCallId: 'call_42', content: [] }] }
+    expect(resultCallId(message)).toBe('call_42')
+  })
+
+  it('returns undefined when no identity is present', () => {
+    expect(resultCallId({ content: [{ type: 'text', text: 'hi' }] })).toBeUndefined()
+    expect(resultCallId({ content: 'plain string' })).toBeUndefined()
+    expect(resultCallId({})).toBeUndefined()
+    expect(resultCallId(null)).toBeUndefined()
+    expect(resultCallId(undefined)).toBeUndefined()
   })
 })
 

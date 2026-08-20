@@ -33,7 +33,7 @@ import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-plan-mode'
 import { Tui, type TuiCommand } from './ui.ts'
-import { previewArgs, previewResult, summarize, trajectoryLine } from './helpers.ts'
+import { previewArgs, previewResult, resultCallId, summarize, trajectoryLine } from './helpers.ts'
 // Empty type imports carry the loader Context merge for the settlement await
 // and the cmdline Context merge for the appExit host value.
 import type {} from '@deepseek-ai/cordis-plugin-loader'
@@ -101,13 +101,17 @@ async function runTurn(
           kind: 'tool',
           text: event.data.name,
           name: event.data.name,
+          callId: String(event.data.callId),
           status: 'running',
           detail: previewArgs(event.data.arguments),
         })
       } else if (event.type === 'tool/result') {
-        ui.updateLastTool(
+        // Correlate on the call identity: tools run in parallel, so results do
+        // not necessarily arrive in the order the calls were appended.
+        ui.updateTool(
           event.data.error ? 'error' : 'done',
           previewResult(event.data.message),
+          resultCallId(event.data.message),
         )
       } else if (event.type === 'assistant/message' && event.data.usage) {
         ui.addTokens(event.data.usage)
