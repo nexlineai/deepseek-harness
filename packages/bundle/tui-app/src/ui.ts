@@ -3,17 +3,22 @@
  *
  * A Claude Code / opencode-style full-screen layout rendered with raw ANSI:
  *
- *   ┌ DeepSeek Harness TUI · model · session ──────────────┐  header
- *   │ conversation scrollback (wrapped, colored)           │  log area
- *   │                                                      │
- *   │ ❯ input line with cursor, history, / completions     │  input row
- *   │ model · session · cwd · streaming · hints            │  status bar
- *   └──────────────────────────────────────────────────────┘
+ *   ┌ DeepSeek Harness TUI · deepseek-official/deepseek-v4-flash · a1b2c3d4 ┐  header
+ *   │ ──────────────────────────────────────────────────────────────────── │  turn separator
+ *   │ ❯ count to 3                                                        │  user (bold, cyan prefix)
+ *   │ · I need to produce a short sequence of integers...                  │  reasoning (dim italic)
+ *   │ 1, 2, 3, 4, 5.                                                      │  assistant (streamed)
+ *   │ ┌─ ⏱ bash ────────────────────────────────────────────────────────┐ │  tool block
+ *   │ │ $ echo hello                                                     │ │
+ *   │ └─ ✓ done ────────────────────────────────────────────────────────┘ │
+ *   │ ✖ error message                                                     │  error (red)
+ *   │ ❯ input line (single row, scrolls horizontally)                    │  input
+ *   │ model · session · stream on · 12→45 tok · cwd          ⠋ /help    │  status bar
  *
  * Key handling (raw mode on a TTY): arrows move the cursor and walk prompt
  * history, Home/End, Backspace/Delete, Tab completes slash commands, Enter
- * submits, Ctrl+C clears (empty → exit), Ctrl+D exits. Non-TTY stdin (pipes)
- * falls back to plain line reads so the driver stays testable.
+ * submits, Alt+Enter inserts a newline, Ctrl+C clears (empty → exit), Ctrl+D
+ * exits. Non-TTY stdin (pipes) falls back to plain line reads.
  *
  * @module @deepseek-ai/dsh-tui-app/ui
  */
@@ -23,8 +28,14 @@ import { StringDecoder } from 'node:string_decoder'
 
 /** One conversation log entry. */
 export interface TuiEntry {
-  kind: 'user' | 'assistant' | 'tool' | 'error' | 'system'
+  kind: 'user' | 'assistant' | 'reasoning' | 'tool' | 'error' | 'system' | 'separator'
   text: string
+  /** Tool name (kind 'tool'). */
+  name?: string
+  /** Tool lifecycle marker. */
+  status?: 'running' | 'done' | 'error'
+  /** Tool args / output preview lines. */
+  detail?: string
 }
 
 /** Commands the UI knows about for / completion and help. */
@@ -40,6 +51,7 @@ const ANSI = {
   reset: '\x1b[0m',
   bold: '\x1b[1m',
   dim: '\x1b[2m',
+  italic: '\x1b[3m',
   inverse: '\x1b[7m',
   red: '\x1b[31m',
   green: '\x1b[32m',
@@ -58,21 +70,13 @@ const ANSI = {
   eraseLine: '\x1b[2K',
 } as const
 
-const KIND_STYLE: Record<TuiEntry['kind'], string> = {
-  user: `${ANSI.cyan}${ANSI.bold}`,
-  assistant: `${ANSI.reset}`,
-  tool: `${ANSI.dim}${ANSI.grey}`,
-  error: `${ANSI.red}`,
-  system: `${ANSI.dim}`,
-}
+/** Box-drawing pieces for tool blocks. */
+const BOX = {
+  tl: '┌', tr: '┐', bl: '└', br: '┘', h: '─', v: '│',
+} as const
 
-const KIND_PREFIX: Record<TuiEntry['kind'], string> = {
-  user: '❯ ',
-  assistant: '',
-  tool: '⏱ ',
-  error: '✖ ',
-  system: '',
-}
+/** Spinner frames while a turn is running. */
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 /** Wrap text to `cols` columns (ANSI-free width math). */
 function wrap(text: string, cols: number): string[] {
@@ -95,9 +99,10 @@ function wrap(text: string, cols: number): string[] {
 
 /**
  * The full-screen surface. Owns raw-mode input, rendering, prompt history,
- * slash-command completion, and the streaming "pending" assistant line.
- * The driver (index.ts) supplies callbacks for submitted prompts and
- * exit requests and drives turns by appending entries / stream chunks.
+ * slash-command completion, streaming "pending" assistant/reasoning lines,
+ * tool blocks, a busy spinner, and token counters. The driver (index.ts)
+ * supplies callbacks for submitted prompts and exit requests and drives
+ * turns by appending entries / stream chunks / tool results.
  */
 export class Tui {
   private readonly commands: TuiCommand[]
@@ -105,7 +110,8 @@ export class Tui {
   private readonly onExit: () => void
 
   private entries: TuiEntry[] = []
-  private pending = ''
+  private pendingText = ''
+  private pendingReasoning = ''
   private statusText = ''
   private buffer = ''
   private cursor = 0
@@ -118,6 +124,19 @@ export class Tui {
   private raw: NodeJS.ReadStream | undefined
   private renderQueued = false
   private resizeListener: (() => void) | undefined
+
+  // Busy state: spinner + live status redraw.
+  private busy = false
+  private spinnerFrame = 0
+  private spinnerTimer: ReturnType<typeof setInterval> | undefined
+
+  // Token accounting for the status bar.
+  private tokensIn = 0
+  private tokensOut = 0
+  private tokensReasoning = 0
+
+  /** Whether reasoning is currently rendered. */
+  private showReasoning = true
 
   constructor(opts: {
     commands: TuiCommand[]
@@ -161,41 +180,84 @@ export class Tui {
   /** Append a conversation entry and redraw. */
   append(entry: TuiEntry): void {
     if (this.exited) return
-    if (entry.kind === 'assistant' && this.pending !== '') {
-      // Finalize any in-flight streamed line first.
-      this.pushPending()
-    }
+    if (entry.kind === 'assistant') this.pushPending()
     this.entries.push(entry)
     this.render()
   }
 
-  /** Begin a streaming assistant response (clears any previous pending). */
+  /** Begin a streaming response: clear pending assistant + reasoning lines. */
   beginStreaming(): void {
-    if (this.pending !== '') this.pushPending()
-    this.pending = ''
+    this.pushPending()
+    this.pendingText = ''
+    this.pendingReasoning = ''
   }
 
-  /** Render one text delta into the streaming line. */
-  streamChunk(text: string): void {
-    this.pending += text
+  /** Render one delta into the streaming lines (text or reasoning). */
+  streamChunk(text: string, reasoning = false): void {
+    if (reasoning) this.pendingReasoning += text
+    else this.pendingText += text
     this.queueRender()
   }
 
-  /** End the streaming line; finalize it into the log. */
+  /** End the streaming lines; finalize them into the log. */
   endStreaming(): void {
-    if (this.pending !== '') this.pushPending()
+    this.pushPending()
   }
 
-  /** Set the status-bar text (model, session, streaming state, ...). */
+  /** Set the status-bar base text (model, session, streaming state, ...). */
   setStatus(text: string): void {
     this.statusText = text
+    this.render()
+  }
+
+  /** Toggle the busy spinner (a turn is in flight). */
+  setBusy(busy: boolean): void {
+    this.busy = busy
+    if (busy) {
+      this.spinnerFrame = 0
+      this.spinnerTimer ??= setInterval(() => {
+        this.spinnerFrame = (this.spinnerFrame + 1) % SPINNER.length
+        this.renderStatusLine()
+      }, 100)
+    } else if (this.spinnerTimer) {
+      clearInterval(this.spinnerTimer)
+      this.spinnerTimer = undefined
+      this.render()
+    }
+  }
+
+  /** Toggle reasoning display. */
+  setShowReasoning(show: boolean): void {
+    this.showReasoning = show
+    this.render()
+  }
+
+  /** Accumulate token usage for the status bar. */
+  addTokens(usage: { inputTokens: number; outputTokens: number; reasoningTokens?: number }): void {
+    this.tokensIn += usage.inputTokens
+    this.tokensOut += usage.outputTokens
+    this.tokensReasoning += usage.reasoningTokens ?? 0
+    this.render()
+  }
+
+  /** Update the most recent tool entry's lifecycle state. */
+  updateLastTool(status: 'done' | 'error', detail?: string): void {
+    for (let i = this.entries.length - 1; i >= 0; i -= 1) {
+      const entry = this.entries[i]
+      if (entry !== undefined && entry.kind === 'tool') {
+        entry.status = status
+        if (detail !== undefined && detail !== '') entry.detail = detail
+        break
+      }
+    }
     this.render()
   }
 
   /** Clear all conversation entries (e.g. /clear). */
   clearLog(): void {
     this.entries = []
-    this.pending = ''
+    this.pendingText = ''
+    this.pendingReasoning = ''
     this.render()
   }
 
@@ -225,6 +287,7 @@ export class Tui {
       }
     }
     if (this.resizeListener) process.stdout.off('resize', this.resizeListener)
+    if (this.spinnerTimer) clearInterval(this.spinnerTimer)
     this.onExit()
   }
 
@@ -239,6 +302,12 @@ export class Tui {
     for (const char of text) {
       if (this.pendingEsc !== '') {
         this.pendingEsc += char
+        // Alt+Enter arrives as ESC + CR: insert a newline instead of waiting.
+        if (this.pendingEsc === '\x1b\r' || this.pendingEsc === '\x1b\n') {
+          this.pendingEsc = ''
+          this.insertChar('\n')
+          continue
+        }
         if (/[A-Za-z~]/.test(char)) {
           const seq = this.pendingEsc
           this.pendingEsc = ''
@@ -267,9 +336,15 @@ export class Tui {
     this.render()
   }
 
+  private insertChar(char: string): void {
+    this.buffer = this.buffer.slice(0, this.cursor) + char + this.buffer.slice(this.cursor)
+    this.cursor += char.length
+    this.render()
+  }
+
   private onChar(char: string): void {
     if (char === '\r' || char === '\n') {
-      // Enter
+      // Enter: submit (Alt+Enter inserts newline, handled in onData).
       const line = this.buffer
       this.buffer = ''
       this.cursor = 0
@@ -303,10 +378,8 @@ export class Tui {
       this.render()
       return
     }
-    if (char >= ' ' && char !== '\x7f') {
-      this.buffer = this.buffer.slice(0, this.cursor) + char + this.buffer.slice(this.cursor)
-      this.cursor += char.length
-      this.render()
+    if (char >= ' ') {
+      this.insertChar(char)
     }
   }
 
@@ -353,7 +426,6 @@ export class Tui {
       this.requestExit()
       return
     }
-    // The driver registers a handler; commands without one render usage.
     if (cmd.handler) {
       cmd.handler(args)
     } else {
@@ -364,9 +436,14 @@ export class Tui {
   // ── rendering ─────────────────────────────────────────────────────────────
 
   private pushPending(): void {
-    if (this.pending === '') return
-    this.entries.push({ kind: 'assistant', text: this.pending })
-    this.pending = ''
+    if (this.pendingText !== '') {
+      this.entries.push({ kind: 'assistant', text: this.pendingText })
+      this.pendingText = ''
+    }
+    if (this.pendingReasoning !== '' && this.showReasoning) {
+      this.entries.push({ kind: 'reasoning', text: this.pendingReasoning })
+      this.pendingReasoning = ''
+    }
   }
 
   private queueRender(): void {
@@ -385,6 +462,49 @@ export class Tui {
     }
   }
 
+  /** Style one entry into wrapped, ANSI-styled log rows. */
+  private styleEntry(entry: TuiEntry, cols: number): string[] {
+    switch (entry.kind) {
+      case 'user':
+        return wrap(`${ANSI.cyan}${ANSI.bold}❯ ${ANSI.reset}${entry.text}`, cols)
+      case 'assistant':
+        return wrap(entry.text, cols)
+      case 'reasoning':
+        return wrap(`${ANSI.grey}${ANSI.dim}${ANSI.italic}· ${entry.text}${ANSI.reset}`, cols)
+      case 'error':
+        return wrap(`${ANSI.red}✖ ${entry.text}${ANSI.reset}`, cols)
+      case 'system':
+        return wrap(`${ANSI.dim}${entry.text}${ANSI.reset}`, cols)
+      case 'separator': {
+        const line = BOX.h.repeat(Math.max(1, cols - 2))
+        return [`${ANSI.dim}${line}${ANSI.reset}`]
+      }
+      case 'tool':
+        return this.styleTool(entry, cols)
+    }
+  }
+
+  /** Render a tool call as a box-drawn block with lifecycle status. */
+  private styleTool(entry: TuiEntry, cols: number): string[] {
+    const inner = Math.max(1, cols - 4)
+    const title = `⏱ ${entry.name ?? 'tool'}`
+    const statusMark = entry.status === 'done' ? `${ANSI.green}✓ done${ANSI.reset}`
+      : entry.status === 'error' ? `${ANSI.red}✖ error${ANSI.reset}`
+        : `${ANSI.yellow}● running${ANSI.reset}`
+    const lines: string[] = []
+    lines.push(`${ANSI.grey}${BOX.tl}${BOX.h} ${title} ${BOX.h.repeat(Math.max(0, inner - title.length - 2))}${BOX.tr}${ANSI.reset}`)
+    const detailLines = wrap(entry.detail ?? '', inner)
+    for (const detail of detailLines.slice(0, 5)) {
+      lines.push(`${ANSI.grey}${BOX.v}${ANSI.reset} ${detail}`)
+    }
+    if (detailLines.length > 5) {
+      lines.push(`${ANSI.grey}${BOX.v}${ANSI.reset} ${ANSI.dim}… ${detailLines.length - 5} more lines${ANSI.reset}`)
+    }
+    const statusLine = `${ANSI.grey}${BOX.bl}${BOX.h} ${statusMark}${ANSI.reset}`
+    lines.push(statusLine)
+    return lines
+  }
+
   private render(): void {
     if (this.exited) return
     const { rows, cols } = this.dims()
@@ -393,48 +513,76 @@ export class Tui {
     const statusRows = 1
     const logRows = Math.max(1, rows - headerRows - inputRows - statusRows - 1)
 
-    // Log area: wrapped lines from the tail.
-    const wrapped: Array<{ kind: TuiEntry['kind']; line: string }> = []
+    // Compose the log area from entries + pending streaming lines.
+    const styled: string[] = []
     for (const entry of this.entries) {
-      for (const line of wrap(entry.text, cols - 2)) {
-        wrapped.push({ kind: entry.kind, line })
-      }
+      styled.push(...this.styleEntry(entry, cols))
     }
-    if (this.pending !== '') {
-      for (const line of wrap(this.pending, cols - 2)) {
-        wrapped.push({ kind: 'assistant', line })
-      }
+    if (this.pendingText !== '') styled.push(...wrap(this.pendingText, cols))
+    if (this.pendingReasoning !== '' && this.showReasoning) {
+      styled.push(...wrap(`${ANSI.grey}${ANSI.dim}${ANSI.italic}· ${this.pendingReasoning}${ANSI.reset}`, cols))
     }
-    const visible = wrapped.slice(-logRows)
+    const visible = styled.slice(-logRows)
 
-    // Compose the frame.
+    // Header: brand left, model/session right.
+    const right = `${ANSI.dim}${this.statusText}${ANSI.reset}`
+    const left = `${ANSI.bold}DeepSeek Harness TUI${ANSI.reset}`
+    const pad = Math.max(1, cols - left.length - right.length)
+    const header = `${left}${' '.repeat(pad)}${right}`
+
     let out = ANSI.hideCursor + ANSI.home
-    // Header
-    out += `${ANSI.bold}DeepSeek Harness TUI${ANSI.reset}${ANSI.dim} — ${this.statusText}${ANSI.reset}\n`
-    // Log
+    out += header + '\n'
     for (let i = 0; i < logRows; i += 1) {
-      const item = visible[i]
-      if (item) {
-        out += `${KIND_STYLE[item.kind]}${KIND_PREFIX[item.kind]}${item.line}${ANSI.reset}\n`
-      } else {
-        out += '\n'
-      }
+      const line = visible[i]
+      if (line) out += `${ANSI.eraseLine}${line}\n`
+      else out += `${ANSI.eraseLine}\n`
     }
-    // Input row: prompt + buffer with the cursor character highlighted.
-    const prompt = `${ANSI.cyan}${ANSI.bold}❯${ANSI.reset} `
-    const promptLen = prompt.length - ANSI.cyan.length - ANSI.bold.length - ANSI.reset.length
+    out += this.inputRow(cols)
+    out += this.statusRow(cols)
+    process.stdout.write(out + ANSI.showCursor)
+
+    // Position the real cursor over the highlighted input character.
+    const inputRow = headerRows + logRows + 1
+    const promptLen = 2 // "❯ "
+    const inputCol = promptLen + Math.min(this.cursor, cols - promptLen - 2) + 1
+    process.stdout.write(ANSI.cursorAt(inputRow, inputCol))
+  }
+
+  private inputRow(cols: number): string {
+    const prompt = `${ANSI.cyan}${ANSI.bold}❯ ${ANSI.reset}`
+    // Single-row input that scrolls horizontally, like Claude Code.
+    const maxLen = Math.max(1, cols - 2)
     const before = this.buffer.slice(0, this.cursor)
     const after = this.buffer.slice(this.cursor)
-    const cursorChar = after[0] ?? ' '
-    out += `${ANSI.eraseLine}${prompt}${before}${ANSI.inverse}${cursorChar}${ANSI.reset}${after.slice(1)}\n`
-    // Status bar: slash-command suggestions while typing a command.
+    // Visible window: show the tail of the buffer when it overflows.
+    const shown = before + after
+    let offset = 0
+    if (shown.length > maxLen) offset = shown.length - maxLen
+    const cursorInShown = this.cursor - offset
+    const cursorChar = shown[cursorInShown] ?? ' '
+    const visBefore = shown.slice(0, cursorInShown)
+    const visAfter = shown.slice(cursorInShown + 1)
+    return `${ANSI.eraseLine}${prompt}${visBefore}${ANSI.inverse}${cursorChar}${ANSI.reset}${visAfter}\n`
+  }
+
+  private statusRow(cols: number): string {
+    const base = this.statusText
+    const busyMark = this.busy ? ` ${SPINNER[this.spinnerFrame]}` : ''
+    const tokens = this.tokensIn + this.tokensOut > 0
+      ? ` · ${this.tokensIn}→${this.tokensOut} tok${this.tokensReasoning > 0 ? ` (+${this.tokensReasoning} think)` : ''}`
+      : ''
     const suggest = this.buffer.startsWith('/') ? this.suggestions() : ''
-    out += `${ANSI.eraseLine}${ANSI.dim}${suggest || this.statusText}${ANSI.reset}`
-    process.stdout.write(out + ANSI.showCursor)
-    // Position the real cursor over the highlighted character.
-    const inputRow = headerRows + logRows + 1
-    const inputCol = promptLen + this.cursor + 1
-    process.stdout.write(ANSI.cursorAt(inputRow, inputCol))
+    const left = suggest || `${base}${tokens}`
+    const right = `${this.buffer.startsWith('/') ? '' : '/help'}${busyMark}`
+    const total = left.length + right.length
+    const pad = Math.max(1, cols - total)
+    return `${ANSI.eraseLine}${ANSI.dim}${left}${' '.repeat(pad)}${right}${ANSI.reset}\n`
+  }
+
+  private renderStatusLine(): void {
+    if (this.exited) return
+    const { rows, cols } = this.dims()
+    process.stdout.write(ANSI.cursorAt(rows, 1) + this.statusRow(cols) + ANSI.showCursor)
   }
 
   private suggestions(): string {

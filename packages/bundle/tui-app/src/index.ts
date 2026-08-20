@@ -115,9 +115,24 @@ async function runTurn(
         if (chunk.type === 'text-delta') {
           streamed = true
           ui.streamChunk(chunk.text)
+        } else if (chunk.type === 'reasoning-delta') {
+          ui.streamChunk(chunk.text, true)
         }
       } else if (event.type === 'tool/call') {
-        ui.append({ kind: 'tool', text: String(event.data.name ?? 'tool') })
+        ui.append({
+          kind: 'tool',
+          text: event.data.name,
+          name: event.data.name,
+          status: 'running',
+          detail: previewArgs(event.data.arguments),
+        })
+      } else if (event.type === 'tool/result') {
+        ui.updateLastTool(
+          event.data.error ? 'error' : 'done',
+          previewResult(event.data.message),
+        )
+      } else if (event.type === 'assistant/message' && event.data.usage) {
+        ui.addTokens(event.data.usage)
       }
     })
   }
@@ -136,6 +151,31 @@ async function runTurn(
   if (outcome.reason?.kind === 'error') {
     ui.append({ kind: 'error', text: `${outcome.reason.error.code}: ${outcome.reason.error.message}` })
   }
+  ui.append({ kind: 'separator', text: '' })
+}
+
+/** Compact preview of a tool call's JSON arguments. */
+function previewArgs(args: string): string {
+  const flat = args.replace(/\s+/g, ' ').trim()
+  return flat === '' ? '(no arguments)' : flat.slice(0, 120)
+}
+
+/** Compact preview of a tool result message. */
+function previewResult(message: unknown): string {
+  try {
+    const content = (message as { content?: unknown }).content
+    if (typeof content === 'string') return content.replace(/\s+/g, ' ').slice(0, 120)
+    if (Array.isArray(content)) {
+      const parts = content
+        .filter((block): block is { type: string; text?: string } => typeof block === 'object' && block !== null)
+        .map(block => block.text ?? '')
+        .filter(Boolean)
+      return parts.join(' ').replace(/\s+/g, ' ').slice(0, 120)
+    }
+  } catch {
+    // non-serializable result; fall through
+  }
+  return '(result)'
 }
 
 /**
@@ -173,10 +213,25 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     `${selection.provider}/${selection.model} · ${shortId} · ${streaming ? 'stream on' : 'stream off'}`
 
   const commands: TuiCommand[] = [
-    { name: 'help', usage: '', help: 'show this help', handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /status /stream on|off /exit — or q / quit / :q' }) },
+    { name: 'help', usage: '', help: 'show this help', handler: () => ui.append({ kind: 'system', text: 'commands: /help /clear /model /status /reasoning on|off /stream on|off /exit — or q / quit / :q' }) },
     { name: 'clear', usage: '', help: 'clear the conversation area', handler: () => ui.clearLog() },
     { name: 'model', usage: '', help: 'show the active model', handler: () => ui.append({ kind: 'system', text: `model: ${selection.provider}/${selection.model}` }) },
     { name: 'status', usage: '', help: 'show session and workspace info', handler: () => ui.append({ kind: 'system', text: `session: ${sessionId} · cwd: ${process.cwd()} · events: ${agent.session.events.length}` }) },
+    {
+      name: 'reasoning',
+      usage: 'on|off',
+      help: 'show or hide the model reasoning (thinking) display',
+      handler: (args) => {
+        const arg = args.toLowerCase()
+        if (arg === 'on' || arg === 'off') {
+          showReasoning = arg === 'on'
+          ui.setShowReasoning(showReasoning)
+          ui.append({ kind: 'system', text: `reasoning: ${showReasoning ? 'on' : 'off'}` })
+        } else {
+          ui.append({ kind: 'system', text: `usage: /reasoning on|off (current: ${showReasoning ? 'on' : 'off'})` })
+        }
+      },
+    },
     {
       name: 'stream',
       usage: 'on|off',
@@ -195,14 +250,22 @@ async function run(ctx: Context, io: TuiIo, seed: string, streaming: boolean): P
     { name: 'quit', usage: '', help: 'leave the session', handler: () => ui.requestExit() },
   ]
 
+  let showReasoning = true
+
   const ui = new Tui({
     commands,
     status: status(),
     onPrompt: (line) => {
       void (async () => {
         ui.append({ kind: 'user', text: line })
-        await runTurn(agent, ui, sessions, line, streaming)
+        ui.setBusy(true)
         ui.setStatus(status())
+        try {
+          await runTurn(agent, ui, sessions, line, streaming)
+        } finally {
+          ui.setBusy(false)
+          ui.setStatus(status())
+        }
       })()
     },
     onExit: () => {
